@@ -32,23 +32,19 @@ public:
   FunctionInstance(const uint32_t ModAddr, const FType &Type,
                    Span<const std::pair<uint32_t, ValType>> Locs,
                    const AST::InstrVec &Expr)
-      : IsHostFunction(false), FuncType(Type), ModuleAddr(ModAddr),
-        Locals(Locs.begin(), Locs.end()) {
-    /// Copy instructions
-    for (auto &It : Expr) {
-      if (auto Res = makeInstructionNode(*It.get())) {
-        Instrs.push_back(std::move(*Res));
-      }
-    }
-  }
+      : ModuleAddr(ModAddr), FuncType(Type),
+        Data(std::in_place_type_t<WasmFunction>(), Locs, Expr) {}
   /// Constructor for host function. Module address will not be used.
   FunctionInstance(std::unique_ptr<HostFunctionBase> &&Func)
-      : IsHostFunction(true), FuncType(Func->getFuncType()), ModuleAddr(0),
-        HostFunc(std::move(Func)) {}
+      : ModuleAddr(0), FuncType(Func->getFuncType()),
+        Data(std::in_place_type_t<std::unique_ptr<HostFunctionBase>>(),
+             std::move(Func)) {}
   virtual ~FunctionInstance() = default;
 
   /// Getter of checking is host function.
-  bool isHostFunction() const { return IsHostFunction; }
+  bool isHostFunction() const {
+    return std::holds_alternative<std::unique_ptr<HostFunctionBase>>(Data);
+  }
 
   /// Getter of module address of this function instance.
   uint32_t getModuleAddr() const { return ModuleAddr; }
@@ -60,37 +56,54 @@ public:
   const FType &getFuncType() const { return FuncType; }
 
   /// Getter of function body instrs.
-  Span<const std::pair<uint32_t, ValType>> getLocals() const { return Locals; }
+  Span<const std::pair<uint32_t, ValType>> getLocals() const {
+    return std::get_if<WasmFunction>(&Data)->Locals;
+  }
 
   /// Getter of function body instrs.
-  const AST::InstrVec &getInstrs() const { return Instrs; }
+  const AST::InstrVec &getInstrs() const {
+    return std::get_if<WasmFunction>(&Data)->Instrs;
+  }
 
   /// Getter of symbol
-  const auto getSymbol() const noexcept { return Symbol; }
+  const auto getSymbol() const noexcept {
+    return std::get_if<WasmFunction>(&Data)->Symbol;
+  }
   /// Setter of symbol
   void setSymbol(DLSymbol<CompiledFunction> S) noexcept {
-    Symbol = std::move(S);
+    std::get_if<WasmFunction>(&Data)->Symbol = std::move(S);
   }
 
   /// Getter of host function.
-  HostFunctionBase &getHostFunc() const { return *HostFunc.get(); }
+  HostFunctionBase &getHostFunc() const {
+    return *std::get_if<std::unique_ptr<HostFunctionBase>>(&Data)->get();
+  }
 
 private:
-  const bool IsHostFunction;
-  const FType &FuncType;
-
   /// \name Data of function instance for native function.
   /// @{
-  uint32_t ModuleAddr;
-  const std::vector<std::pair<uint32_t, ValType>> Locals;
-  AST::InstrVec Instrs;
-  DLSymbol<CompiledFunction> Symbol;
+  struct WasmFunction {
+    std::vector<std::pair<uint32_t, ValType>> Locals;
+    AST::InstrVec Instrs;
+    DLSymbol<CompiledFunction> Symbol;
+    WasmFunction(Span<const std::pair<uint32_t, ValType>> Locs,
+                 const AST::InstrVec &Expr)
+        : Locals(Locs.begin(), Locs.end()) {
+      /// Copy instructions
+      for (auto &It : Expr) {
+        if (auto Res = makeInstructionNode(*It.get())) {
+          Instrs.push_back(std::move(*Res));
+        }
+      }
+    }
+  };
   /// @}
 
-  /// \name Data of function instance for host function.
-  /// @{
-  std::unique_ptr<HostFunctionBase> HostFunc;
-  /// @}
+  uint32_t ModuleAddr;
+
+  const FType &FuncType;
+
+  std::variant<WasmFunction, std::unique_ptr<HostFunctionBase>> Data;
 };
 
 } // namespace Instance
