@@ -8,6 +8,20 @@
 namespace SSVM {
 namespace Interpreter {
 
+namespace {
+static void skipJump(Span<const ValVariant>::iterator &ImmIt) noexcept {
+  std::advance(ImmIt, 4);
+}
+static std::tuple<uint32_t, uint32_t, int32_t, int32_t>
+getJump(Span<const ValVariant>::iterator ImmIt) noexcept {
+  const auto StackEraseBegin = retrieveValue<uint32_t>(ImmIt[0]);
+  const auto StackEraseEnd = retrieveValue<uint32_t>(ImmIt[1]);
+  const auto OpOffset = retrieveValue<int32_t>(ImmIt[2]);
+  const auto ImmOffset = retrieveValue<int32_t>(ImmIt[3]);
+  return {StackEraseBegin, StackEraseEnd, OpOffset, ImmOffset};
+}
+} // namespace
+
 Interpreter *Interpreter::This = nullptr;
 std::jmp_buf *Interpreter::TrapJump = nullptr;
 
@@ -125,10 +139,7 @@ Expect<void> Interpreter::call(Runtime::StoreManager &StoreMgr,
     StackMgr.push(Args[I]);
   }
 
-  if (auto Res = enterFunction(StoreMgr, *FuncInst); unlikely(!Res)) {
-    return Unexpect(Res);
-  }
-  if (auto Res = execute(StoreMgr); unlikely(!Res)) {
+  if (auto Res = execute(StoreMgr, *FuncInst); unlikely(!Res)) {
     return Unexpect(Res);
   }
 
@@ -172,10 +183,7 @@ Expect<void> Interpreter::callIndirect(Runtime::StoreManager &StoreMgr,
     StackMgr.push(Args[I]);
   }
 
-  if (auto Res = enterFunction(StoreMgr, *FuncInst); unlikely(!Res)) {
-    return Unexpect(Res);
-  }
-  if (auto Res = execute(StoreMgr); unlikely(!Res)) {
+  if (auto Res = execute(StoreMgr, *FuncInst); unlikely(!Res)) {
     return Unexpect(Res);
   }
 
@@ -359,8 +367,26 @@ Expect<ValVariant> Interpreter::refFunc(Runtime::StoreManager &StoreMgr,
 
 Expect<void> Interpreter::runExpression(Runtime::StoreManager &StoreMgr,
                                         const AST::InstrVec &Instrs) {
-  enterBlock(0, 0, nullptr, Instrs);
-  return execute(StoreMgr);
+  for (const auto &Instr : Instrs) {
+    /// Run instructions.
+    if (auto Res = AST::dispatchInstruction(
+            Instr->getOpCode(),
+            [this, &Instr, &StoreMgr](auto &&Arg) -> Expect<void> {
+              using InstrT = typename std::decay_t<decltype(Arg)>::type;
+              if constexpr (std::is_void_v<InstrT>) {
+                /// OpCode was checked in validator
+                __builtin_unreachable();
+                return Unexpect(ErrCode::InvalidOpCode);
+              } else {
+                /// Make the instruction node according to Code.
+                return execute(StoreMgr, static_cast<const InstrT &>(*Instr));
+              }
+            });
+        !Res) {
+      return Unexpect(Res);
+    }
+  }
+  return {};
 }
 
 Expect<void>
@@ -381,11 +407,8 @@ Interpreter::runFunction(Runtime::StoreManager &StoreMgr,
     StackMgr.push(Val);
   }
 
-  /// Enter and execute function.
-  auto Res = enterFunction(StoreMgr, Func);
-  if (Res) {
-    Res = execute(StoreMgr);
-  }
+  /// Execute function.
+  auto Res = execute(StoreMgr, Func);
 
   if (Res) {
     LOG(DEBUG) << " Execution succeeded.";
@@ -438,7 +461,6 @@ Expect<void> Interpreter::execute(Runtime::StoreManager &StoreMgr,
   case OpCode::Return:
     return runReturnOp();
   case OpCode::End:
-    StackMgr.endExpression();
     return {};
   default:
     __builtin_unreachable();
@@ -995,50 +1017,8 @@ Expect<void> Interpreter::execute(Runtime::StoreManager &StoreMgr,
   }
 }
 
-Expect<void> Interpreter::execute(Runtime::StoreManager &StoreMgr) {
-  /// Run instructions until end.
-  const AST::Instruction *Instr = StackMgr.getNextInstr();
-  while (Instr != nullptr) {
-    OpCode Code = Instr->getOpCode();
-    if (Stat) {
-      Stat->incInstrCount();
-      /// Add cost. Note: if-else case should be processed additionally.
-      if (unlikely(!Stat->addInstrCost(Code))) {
-        return Unexpect(ErrCode::CostLimitExceeded);
-      }
-    }
-    /// Run instructions.
-    auto Res = AST::dispatchInstruction(
-        Code, [this, &Instr, &StoreMgr](auto &&Arg) -> Expect<void> {
-          using InstrT = typename std::decay_t<decltype(Arg)>::type;
-          if constexpr (std::is_void_v<InstrT>) {
-            /// OpCode was checked in validator
-            __builtin_unreachable();
-            return Unexpect(ErrCode::InvalidOpCode);
-          } else {
-            /// Make the instruction node according to Code.
-            return execute(StoreMgr, *static_cast<const InstrT *>(Instr));
-          }
-        });
-    if (!Res) {
-      return Unexpect(Res);
-    }
-    Instr = StackMgr.getNextInstr();
-  }
-  return {};
-}
-
-Expect<void> Interpreter::enterBlock(const uint32_t Locals,
-                                     const uint32_t Arity,
-                                     const AST::BlockControlInstruction *Instr,
-                                     const AST::InstrVec &Seq) {
-  /// Create and push label for block and jump to block body.
-  StackMgr.pushLabel(Locals, Arity, Seq, Instr);
-  return {};
-}
-
 Expect<void>
-Interpreter::enterFunction(Runtime::StoreManager &StoreMgr,
+Interpreter::execute(Runtime::StoreManager &StoreMgr,
                            const Runtime::Instance::FunctionInstance &Func) {
   /// Get function type
   const auto &FuncType = Func.getFuncType();
@@ -1146,24 +1126,284 @@ Interpreter::enterFunction(Runtime::StoreManager &StoreMgr,
       }
     }
 
-    /// Enter function block []->[returns] with label{none}.
-    return enterBlock(0, FuncType.Returns.size(), nullptr, Func.getInstrs());
+    auto OpCodes = Func.getOpCodes();
+    auto Intermediates = Func.getIntermediates();
+    auto OpIt = OpCodes.begin();
+    auto ImmIt = Intermediates.begin();
+    bool IsEnd = false;
+    while (!IsEnd) {
+      switch (OpIt->Code) {
+      case OpCode::Unreachable:
+        LOG(ERROR) << ErrCode::Unreachable;
+        LOG(ERROR) << ErrInfo::InfoInstruction(OpIt->Code, OpIt->Offset);
+        return Unexpect(ErrCode::Unreachable);
+      case OpCode::Nop:
+      case OpCode::Block:
+      case OpCode::Loop:
+        break;
+      case OpCode::End: {
+        if (OpIt == OpCodes.end()) {
+          assert(ImmIt == Intermediates.end());
+          IsEnd = true;
+          continue;
+        }
+        break;
+      }
+      case OpCode::If: {
+        const uint32_t Cond = retrieveValue<uint32_t>(StackMgr.pop());
+        if (Cond != 0) {
+          skipJump(ImmIt);
+        } else {
+          const auto [StackEraseBegin, StackEraseEnd, OpOffset, ImmOffset] =
+              getJump(ImmIt);
+          StackMgr.erase(StackEraseBegin, StackEraseEnd);
+          OpIt += OpOffset;
+          ImmIt += ImmOffset;
+        }
+        break;
+      }
+      case OpCode::Else: {
+        break;
+      }
+      case OpCode::Br:
+      case OpCode::Br_if:
+      case OpCode::Return: {
+        break;
+      }
+      case OpCode::Br_table: {
+        break;
+      }
+
+      case OpCode::Call: {
+        break;
+      }
+      case OpCode::Call_indirect: {
+        break;
+      }
+
+      case OpCode::Ref__null: {
+        StackMgr.push(genNullRef(RefType(std::get<uint32_t>(*ImmIt))));
+        break;
+      }
+      case OpCode::Ref__is_null:
+      case OpCode::Ref__func:
+        return Visitor(Support::tag<ReferenceInstruction>());
+
+      case OpCode::Drop:
+      case OpCode::Select:
+      case OpCode::Select_t:
+        return Visitor(Support::tag<ParametricInstruction>());
+
+      case OpCode::Local__get:
+      case OpCode::Local__set:
+      case OpCode::Local__tee:
+      case OpCode::Global__get:
+      case OpCode::Global__set:
+        return Visitor(Support::tag<VariableInstruction>());
+
+      case OpCode::Table__get:
+      case OpCode::Table__set:
+      case OpCode::Table__init:
+      case OpCode::Elem__drop:
+      case OpCode::Table__copy:
+      case OpCode::Table__grow:
+      case OpCode::Table__size:
+      case OpCode::Table__fill:
+        return Visitor(Support::tag<TableInstruction>());
+
+      case OpCode::I32__load:
+      case OpCode::I64__load:
+      case OpCode::F32__load:
+      case OpCode::F64__load:
+      case OpCode::I32__load8_s:
+      case OpCode::I32__load8_u:
+      case OpCode::I32__load16_s:
+      case OpCode::I32__load16_u:
+      case OpCode::I64__load8_s:
+      case OpCode::I64__load8_u:
+      case OpCode::I64__load16_s:
+      case OpCode::I64__load16_u:
+      case OpCode::I64__load32_s:
+      case OpCode::I64__load32_u:
+      case OpCode::I32__store:
+      case OpCode::I64__store:
+      case OpCode::F32__store:
+      case OpCode::F64__store:
+      case OpCode::I32__store8:
+      case OpCode::I32__store16:
+      case OpCode::I64__store8:
+      case OpCode::I64__store16:
+      case OpCode::I64__store32:
+      case OpCode::Memory__size:
+      case OpCode::Memory__grow:
+      case OpCode::Memory__init:
+      case OpCode::Data__drop:
+      case OpCode::Memory__copy:
+      case OpCode::Memory__fill:
+        return Visitor(Support::tag<MemoryInstruction>());
+
+      case OpCode::I32__const:
+      case OpCode::I64__const:
+      case OpCode::F32__const:
+      case OpCode::F64__const:
+        return Visitor(Support::tag<ConstInstruction>());
+
+      case OpCode::I32__eqz:
+      case OpCode::I32__clz:
+      case OpCode::I32__ctz:
+      case OpCode::I32__popcnt:
+      case OpCode::I64__eqz:
+      case OpCode::I64__clz:
+      case OpCode::I64__ctz:
+      case OpCode::I64__popcnt:
+      case OpCode::F32__abs:
+      case OpCode::F32__neg:
+      case OpCode::F32__ceil:
+      case OpCode::F32__floor:
+      case OpCode::F32__trunc:
+      case OpCode::F32__nearest:
+      case OpCode::F32__sqrt:
+      case OpCode::F64__abs:
+      case OpCode::F64__neg:
+      case OpCode::F64__ceil:
+      case OpCode::F64__floor:
+      case OpCode::F64__trunc:
+      case OpCode::F64__nearest:
+      case OpCode::F64__sqrt:
+      case OpCode::I32__wrap_i64:
+      case OpCode::I32__trunc_f32_s:
+      case OpCode::I32__trunc_f32_u:
+      case OpCode::I32__trunc_f64_s:
+      case OpCode::I32__trunc_f64_u:
+      case OpCode::I64__extend_i32_s:
+      case OpCode::I64__extend_i32_u:
+      case OpCode::I64__trunc_f32_s:
+      case OpCode::I64__trunc_f32_u:
+      case OpCode::I64__trunc_f64_s:
+      case OpCode::I64__trunc_f64_u:
+      case OpCode::F32__convert_i32_s:
+      case OpCode::F32__convert_i32_u:
+      case OpCode::F32__convert_i64_s:
+      case OpCode::F32__convert_i64_u:
+      case OpCode::F32__demote_f64:
+      case OpCode::F64__convert_i32_s:
+      case OpCode::F64__convert_i32_u:
+      case OpCode::F64__convert_i64_s:
+      case OpCode::F64__convert_i64_u:
+      case OpCode::F64__promote_f32:
+      case OpCode::I32__reinterpret_f32:
+      case OpCode::I64__reinterpret_f64:
+      case OpCode::F32__reinterpret_i32:
+      case OpCode::F64__reinterpret_i64:
+      case OpCode::I32__extend8_s:
+      case OpCode::I32__extend16_s:
+      case OpCode::I64__extend8_s:
+      case OpCode::I64__extend16_s:
+      case OpCode::I64__extend32_s:
+      case OpCode::I32__trunc_sat_f32_s:
+      case OpCode::I32__trunc_sat_f32_u:
+      case OpCode::I32__trunc_sat_f64_s:
+      case OpCode::I32__trunc_sat_f64_u:
+      case OpCode::I64__trunc_sat_f32_s:
+      case OpCode::I64__trunc_sat_f32_u:
+      case OpCode::I64__trunc_sat_f64_s:
+      case OpCode::I64__trunc_sat_f64_u:
+        return Visitor(Support::tag<UnaryNumericInstruction>());
+
+      case OpCode::I32__eq:
+      case OpCode::I32__ne:
+      case OpCode::I32__lt_s:
+      case OpCode::I32__lt_u:
+      case OpCode::I32__gt_s:
+      case OpCode::I32__gt_u:
+      case OpCode::I32__le_s:
+      case OpCode::I32__le_u:
+      case OpCode::I32__ge_s:
+      case OpCode::I32__ge_u:
+      case OpCode::I64__eq:
+      case OpCode::I64__ne:
+      case OpCode::I64__lt_s:
+      case OpCode::I64__lt_u:
+      case OpCode::I64__gt_s:
+      case OpCode::I64__gt_u:
+      case OpCode::I64__le_s:
+      case OpCode::I64__le_u:
+      case OpCode::I64__ge_s:
+      case OpCode::I64__ge_u:
+      case OpCode::F32__eq:
+      case OpCode::F32__ne:
+      case OpCode::F32__lt:
+      case OpCode::F32__gt:
+      case OpCode::F32__le:
+      case OpCode::F32__ge:
+      case OpCode::F64__eq:
+      case OpCode::F64__ne:
+      case OpCode::F64__lt:
+      case OpCode::F64__gt:
+      case OpCode::F64__le:
+      case OpCode::F64__ge:
+
+      case OpCode::I32__add:
+      case OpCode::I32__sub:
+      case OpCode::I32__mul:
+      case OpCode::I32__div_s:
+      case OpCode::I32__div_u:
+      case OpCode::I32__rem_s:
+      case OpCode::I32__rem_u:
+      case OpCode::I32__and:
+      case OpCode::I32__or:
+      case OpCode::I32__xor:
+      case OpCode::I32__shl:
+      case OpCode::I32__shr_s:
+      case OpCode::I32__shr_u:
+      case OpCode::I32__rotl:
+      case OpCode::I32__rotr:
+      case OpCode::I64__add:
+      case OpCode::I64__sub:
+      case OpCode::I64__mul:
+      case OpCode::I64__div_s:
+      case OpCode::I64__div_u:
+      case OpCode::I64__rem_s:
+      case OpCode::I64__rem_u:
+      case OpCode::I64__and:
+      case OpCode::I64__or:
+      case OpCode::I64__xor:
+      case OpCode::I64__shl:
+      case OpCode::I64__shr_s:
+      case OpCode::I64__shr_u:
+      case OpCode::I64__rotl:
+      case OpCode::I64__rotr:
+      case OpCode::F32__add:
+      case OpCode::F32__sub:
+      case OpCode::F32__mul:
+      case OpCode::F32__div:
+      case OpCode::F32__min:
+      case OpCode::F32__max:
+      case OpCode::F32__copysign:
+      case OpCode::F64__add:
+      case OpCode::F64__sub:
+      case OpCode::F64__mul:
+      case OpCode::F64__div:
+      case OpCode::F64__min:
+      case OpCode::F64__max:
+      case OpCode::F64__copysign:
+        return Visitor(Support::tag<BinaryNumericInstruction>());
+
+      default:
+        return Visitor(Support::tag<void>());
+      }
+    }
+
+    return {};
   }
-}
 
-Expect<void> Interpreter::branchToLabel(Runtime::StoreManager &StoreMgr,
-                                        const uint32_t Cnt) {
-  /// Get the L-th label from top of stack and the continuation instruction.
-  const auto *ContInstr = StackMgr.getLabelWithCount(Cnt).Target;
 
-  /// Pop L + 1 labels.
-  StackMgr.popLabel(Cnt + 1);
-
-  /// Jump to the continuation of Label
-  if (ContInstr != nullptr) {
-    return runLoopOp(StoreMgr, *ContInstr);
+    auto Res = Func.visit([this, &StoreMgr](const auto &Instr) {
+      return execute(StoreMgr, Instr);
+    });
+    StackMgr.popFrame();
+    return Res;
   }
-  return {};
 }
 
 Runtime::Instance::TableInstance *

@@ -26,16 +26,28 @@ namespace Instance {
 class FunctionInstance {
 public:
   using CompiledFunction = void;
+  struct PackedOpCode {
+    constexpr PackedOpCode(OpCode C, uint32_t O) : Code(C), Offset(O) {}
+    OpCode Code;
+    uint32_t Offset;
+  };
 
   FunctionInstance() = delete;
   /// Constructor for native function.
   FunctionInstance(const uint32_t ModAddr, const FType &Type,
                    Span<const std::pair<uint32_t, ValType>> Locs,
-                   const AST::InstrVec &Expr)
+                   const Runtime::Instance::ModuleInstance &ModInst,
+                   const AST::InstrVec &Expr) noexcept
       : ModuleAddr(ModAddr), FuncType(Type),
-        Data(std::in_place_type_t<WasmFunction>(), Locs, Expr) {}
+        Data(std::in_place_type_t<WasmFunction>(), Locs, Type, ModInst, Expr) {}
+  /// Constructor for compiled function.
+  FunctionInstance(const uint32_t ModAddr, const FType &Type,
+                   DLSymbol<CompiledFunction> S) noexcept
+      : ModuleAddr(ModAddr), FuncType(Type),
+        Data(std::in_place_type_t<DLSymbol<CompiledFunction>>(), std::move(S)) {
+  }
   /// Constructor for host function. Module address will not be used.
-  FunctionInstance(std::unique_ptr<HostFunctionBase> &&Func)
+  FunctionInstance(std::unique_ptr<HostFunctionBase> &&Func) noexcept
       : ModuleAddr(0), FuncType(Func->getFuncType()),
         Data(std::in_place_type_t<std::unique_ptr<HostFunctionBase>>(),
              std::move(Func)) {}
@@ -60,18 +72,19 @@ public:
     return std::get_if<WasmFunction>(&Data)->Locals;
   }
 
-  /// Getter of function body instrs.
-  const AST::InstrVec &getInstrs() const {
-    return std::get_if<WasmFunction>(&Data)->Instrs;
+  /// Getter of function body OpCodes.
+  Span<const PackedOpCode> getOpCodes() const {
+    return std::get_if<WasmFunction>(&Data)->OpCodes;
+  }
+
+  /// Getter of function body Intermediates.
+  Span<const ValVariant> getIntermediates() const {
+    return std::get_if<WasmFunction>(&Data)->Intermediates;
   }
 
   /// Getter of symbol
   const auto getSymbol() const noexcept {
-    return std::get_if<WasmFunction>(&Data)->Symbol;
-  }
-  /// Setter of symbol
-  void setSymbol(DLSymbol<CompiledFunction> S) noexcept {
-    std::get_if<WasmFunction>(&Data)->Symbol = std::move(S);
+    return *std::get_if<DLSymbol<CompiledFunction>>(&Data);
   }
 
   /// Getter of host function.
@@ -84,18 +97,12 @@ private:
   /// @{
   struct WasmFunction {
     std::vector<std::pair<uint32_t, ValType>> Locals;
-    AST::InstrVec Instrs;
-    DLSymbol<CompiledFunction> Symbol;
+    std::vector<PackedOpCode> OpCodes;
+    std::vector<ValVariant> Intermediates;
     WasmFunction(Span<const std::pair<uint32_t, ValType>> Locs,
-                 const AST::InstrVec &Expr)
-        : Locals(Locs.begin(), Locs.end()) {
-      /// Copy instructions
-      for (auto &It : Expr) {
-        if (auto Res = makeInstructionNode(*It.get())) {
-          Instrs.push_back(std::move(*Res));
-        }
-      }
-    }
+                 const FType &Type,
+                 const Runtime::Instance::ModuleInstance &ModInst,
+                 const AST::InstrVec &Expr) noexcept;
   };
   /// @}
 
@@ -103,7 +110,9 @@ private:
 
   const FType &FuncType;
 
-  std::variant<WasmFunction, std::unique_ptr<HostFunctionBase>> Data;
+  std::variant<WasmFunction, std::unique_ptr<HostFunctionBase>,
+               DLSymbol<CompiledFunction>>
+      Data;
 };
 
 } // namespace Instance

@@ -184,7 +184,6 @@ private:
 
   /// \name Functions for instruction dispatchers.
   /// @{
-  Expect<void> execute(Runtime::StoreManager &StoreMgr);
   Expect<void> execute(Runtime::StoreManager &StoreMgr,
                        const AST::ControlInstruction &Instr);
   Expect<void> execute(Runtime::StoreManager &StoreMgr,
@@ -215,21 +214,9 @@ private:
                        const AST::BinaryNumericInstruction &Instr);
   /// @}
 
-  /// \name Helper Functions for block controls.
-  /// @{
-  /// Helper function for entering blocks.
-  Expect<void> enterBlock(const uint32_t Locals, const uint32_t Arity,
-                          const AST::BlockControlInstruction *Instr,
-                          const AST::InstrVec &Seq);
-
   /// Helper function for calling functions.
-  Expect<void> enterFunction(Runtime::StoreManager &StoreMgr,
-                             const Runtime::Instance::FunctionInstance &Func);
-
-  /// Helper function for branching to label.
-  Expect<void> branchToLabel(Runtime::StoreManager &StoreMgr,
-                             const uint32_t Cnt);
-  /// @}
+  Expect<void> execute(Runtime::StoreManager &StoreMgr,
+                       const Runtime::Instance::FunctionInstance &Func);
 
   /// \name Helper Functions for getting instances.
   /// @{

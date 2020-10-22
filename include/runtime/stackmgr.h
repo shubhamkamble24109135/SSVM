@@ -24,28 +24,13 @@ namespace Runtime {
 
 class StackManager {
 public:
-  struct Label {
-    Label() = delete;
-    Label(const uint32_t S, const uint32_t A, const AST::InstrVec &Body,
-          const AST::BlockControlInstruction *Cont)
-        : VStackOff(S), Arity(A), Target(Cont), Curr(Body.cbegin()),
-          End(Body.cend()) {}
-    uint32_t VStackOff;
-    uint32_t Arity;
-    const AST::BlockControlInstruction *Target;
-    AST::InstrIter Curr;
-    AST::InstrIter End;
-  };
-
   struct Frame {
     Frame() = delete;
-    Frame(const uint32_t Addr, const uint32_t VS, const uint32_t LS,
-          const uint32_t A, const bool Dummy = false)
-        : ModAddr(Addr), VStackOff(VS), LStackOff(LS), Arity(A),
-          IsDummy(Dummy) {}
+    Frame(const uint32_t Addr, const uint32_t VS, const uint32_t A,
+          const bool Dummy = false)
+        : ModAddr(Addr), VStackOff(VS), Arity(A), IsDummy(Dummy) {}
     uint32_t ModAddr;
     uint32_t VStackOff;
-    uint32_t LStackOff;
     uint32_t Arity;
     bool IsDummy;
   };
@@ -57,7 +42,6 @@ public:
   /// unexpect operations will occur.
   StackManager() {
     ValueStack.reserve(2048U);
-    LabelStack.reserve(64U);
     FrameStack.reserve(16U);
   };
   ~StackManager() = default;
@@ -88,68 +72,35 @@ public:
     return V;
   }
 
+  /// Unsafe erase values.
+  void erase(uint32_t Begin, uint32_t End) {
+    const auto MinimumStackSize [[maybe_unused]] =
+        FrameStack.back().VStackOff + FrameStack.back().Arity;
+    assert(Begin >= MinimumStackSize);
+    assert(End >= MinimumStackSize);
+    assert(ValueStack.size() - (End - Begin) >= MinimumStackSize);
+    ValueStack.erase(ValueStack.end() - Begin, ValueStack.end() - End);
+    FrameStack.pop_back();
+  }
+
   /// Push a new frame entry to stack.
   void pushFrame(const uint32_t ModuleAddr, const uint32_t LocalNum = 0,
                  const uint32_t ArityNum = 0) {
-    FrameStack.emplace_back(ModuleAddr, ValueStack.size() - LocalNum,
-                            LabelStack.size(), ArityNum);
+    FrameStack.emplace_back(ModuleAddr, ValueStack.size() - LocalNum, ArityNum);
   }
 
   /// Push a dummy frame for invokation base.
   void pushDummyFrame() {
-    FrameStack.emplace_back(0, ValueStack.size(), LabelStack.size(), 0, true);
+    FrameStack.emplace_back(0, ValueStack.size(), 0, true);
   }
 
   /// Unsafe pop top frame.
   void popFrame() {
-    assert(LabelStack.size() >= FrameStack.back().LStackOff);
-    LabelStack.erase(LabelStack.begin() + FrameStack.back().LStackOff,
-                     LabelStack.end());
     assert(ValueStack.size() >=
            FrameStack.back().VStackOff + FrameStack.back().Arity);
     ValueStack.erase(ValueStack.begin() + FrameStack.back().VStackOff,
                      ValueStack.end() - FrameStack.back().Arity);
     FrameStack.pop_back();
-  }
-
-  /// Push a new label entry to stack.
-  void pushLabel(const uint32_t LocalNum, const uint32_t ArityNum,
-                 const AST::InstrVec &Body,
-                 const AST::BlockControlInstruction *Cont = nullptr) {
-    LabelStack.emplace_back(ValueStack.size() - LocalNum, ArityNum, Body, Cont);
-  }
-
-  /// Unsafe pop top label.
-  void popLabel(const uint32_t Cnt = 1) {
-    const auto &L = getLabelWithCount(Cnt - 1);
-    ValueStack.erase(ValueStack.begin() + L.VStackOff,
-                     ValueStack.end() - L.Arity);
-    for (uint32_t I = 0; I < Cnt; ++I) {
-      LabelStack.pop_back();
-    }
-  }
-
-  /// Unsafe leave top label.
-  void leaveLabel() { LabelStack.pop_back(); }
-
-  /// Unsafe getter of next instruction to execute.
-  const AST::Instruction *getNextInstr() {
-    if (LabelStack.size() == 0) {
-      return nullptr;
-    }
-    auto &L = LabelStack.back();
-    /// There's always an End instruction before the end of instruction vector.
-    /// Therefore, leaveLabel will occur before iterating out of bounds.
-    return (*(L.Curr++)).get();
-  }
-
-  void endExpression() {
-    leaveLabel();
-    if (FrameStack.size() > 1 &&
-        FrameStack.back().LStackOff == LabelStack.size()) {
-      /// Noted that there's always a base frame in stack.
-      popFrame();
-    }
   }
 
   /// Unsafe getter of module address.
@@ -160,18 +111,12 @@ public:
     return FrameStack.back().VStackOff + Idx;
   }
 
-  /// Unsafe getter of the top count of label which index start from 0.
-  const Label &getLabelWithCount(const uint32_t Count) const {
-    return LabelStack[LabelStack.size() - Count - 1];
-  }
-
   /// Unsafe checker of top frame is a dummy frame.
   bool isTopDummyFrame() { return FrameStack.back().IsDummy; }
 
   /// Reset stack.
   void reset() {
     ValueStack.clear();
-    LabelStack.clear();
     FrameStack.clear();
   }
 
@@ -179,7 +124,6 @@ private:
   /// \name Data of stack manager.
   /// @{
   std::vector<Value> ValueStack;
-  std::vector<Label> LabelStack;
   std::vector<Frame> FrameStack;
   /// @}
 };
