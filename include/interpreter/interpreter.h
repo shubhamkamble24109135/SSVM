@@ -86,15 +86,14 @@ public:
   Interpreter(const ProposalConfigure &PConf,
               Statistics::Statistics *S = nullptr)
       : PConf(PConf), Stat(S) {
-    assert(This == nullptr);
-    This = this;
+    InstanceIncrease();
     if (Stat) {
       ExecutionContext.InstrCount = &Stat->getInstrCountRef();
       ExecutionContext.CostTable = Stat->getCostTable().data();
       ExecutionContext.Gas = &Stat->getTotalCostRef();
     }
   }
-  ~Interpreter() noexcept { This = nullptr; }
+  ~Interpreter() noexcept { InstanceDecrease(); }
 
   /// Instantiate Wasm Module.
   Expect<void> instantiateModule(Runtime::StoreManager &StoreMgr,
@@ -399,9 +398,9 @@ private:
   /// @{
 
   /// Pointer to current object.
-  static Interpreter *This;
+  static thread_local Interpreter *This;
   /// jmp_buf for trap.
-  static sigjmp_buf *TrapJump;
+  sigjmp_buf *TrapJump;
 
 public:
   Expect<void> trap(Runtime::StoreManager &StoreMgr,
@@ -454,11 +453,15 @@ public:
   Expect<ValVariant> refFunc(Runtime::StoreManager &StoreMgr,
                              const uint32_t FuncIndex) noexcept;
 
-  static void signalEnable() noexcept;
-  static void signalDisable() noexcept;
+  static void InstanceIncrease();
+  static void InstanceDecrease();
+
+  void enterCompiledContext() noexcept;
+  void leaveCompiledContext() noexcept;
+
   static void signalHandler(int Signal, siginfo_t *Siginfo, void *) noexcept;
-  struct SignalEnabler;
-  struct SignalDisabler;
+  struct CompiledContext;
+  struct HostContext;
   template <typename FuncPtr> struct ProxyHelper;
   /// @}
 

@@ -19,12 +19,15 @@
 #include "common/value.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <memory>
-#include <set>
+#include <mutex>
+#include <optional>
 #include <utility>
+#include <vector>
 
 #include <linux/mman.h>
 #include <sys/mman.h>
@@ -35,24 +38,53 @@ namespace Instance {
 
 class MemoryInstance {
 private:
+  /// Protect `Used` across threads
+  static inline std::mutex Mutex;
+  /// Store sorted begins of memory regions assigned to a `MemoryInstance`
+  static inline std::vector<uintptr_t> Used;
+
+  /// Parse `/proc/self/smaps` for available memory region
   static uintptr_t getUsableAddress() {
-    /// Parse smaps for available memory region
-    std::set<std::pair<uintptr_t, uintptr_t>> Regions;
+    /// Store sorted begins and ends of used memory regions, aligned to
+    /// kPageSize
+    std::optional<std::pair<uintptr_t, uintptr_t>> PrevRegion;
+    auto UpdatePrevRegion =
+        [&PrevRegion](const std::pair<uintptr_t, uintptr_t> NewRegion)
+        -> std::optional<uintptr_t> {
+      if (PrevRegion && PrevRegion->second >= NewRegion.first) {
+        /// Merge current region with previous one
+        PrevRegion->second = std::max(PrevRegion->second, NewRegion.second);
+      } else if (PrevRegion && NewRegion.first - PrevRegion->second >= k12G) {
+        return PrevRegion->second + k4G;
+      } else {
+        /// Set current as previous region
+        PrevRegion = NewRegion;
+      }
+      return {};
+    };
+    auto UsedIter = Used.begin();
     std::ifstream Smaps("/proc/self/smaps");
     for (std::string Line; std::getline(Smaps, Line);) {
       if (std::isdigit(Line.front()) || std::islower(Line.front())) {
         char *Cursor = nullptr;
         const uintptr_t Begin = std::strtoull(Line.c_str(), &Cursor, 16);
-        const uintptr_t End = std::strtoull(++Cursor, &Cursor, 16);
-        Regions.emplace(Begin, End);
-      }
-    }
-    for (auto Prev = Regions.cbegin(), Next = std::next(Prev);
-         Next != Regions.cend(); ++Prev, ++Next) {
-      if (Next->first - Prev->second >= k12G) {
-        const auto PaddedBegin = (Prev->second + kPageMask) & ~kPageMask;
-        if (Next->first - PaddedBegin >= k12G) {
-          return PaddedBegin + k4G;
+        ++Cursor;
+        const uintptr_t End = std::strtoull(Cursor, &Cursor, 16);
+        const uintptr_t PaddingBegin = Begin & ~kPageMask;
+        const uintptr_t PaddingEnd = (End + kPageMask) & ~kPageMask;
+        while (UsedIter != Used.end()) {
+          const uintptr_t UsedBegin = *UsedIter - k4G;
+          const uintptr_t UsedEnd = *UsedIter + k8G;
+          if (UsedBegin > PaddingBegin) {
+            break;
+          }
+          if (auto Result = UpdatePrevRegion({UsedBegin, UsedEnd})) {
+            return *Result;
+          }
+          ++UsedIter;
+        }
+        if (auto Result = UpdatePrevRegion({PaddingBegin, PaddingEnd})) {
+          return *Result;
         }
       }
     }
@@ -68,22 +100,34 @@ public:
   MemoryInstance() = delete;
   MemoryInstance(const AST::Limit &Lim)
       : HasMaxPage(Lim.hasMax()), MinPage(Lim.getMin()), MaxPage(Lim.getMax()) {
+    std::unique_lock Lock(Mutex);
     const auto UsableAddress = getUsableAddress();
     if (UsableAddress == UINT64_C(-1)) {
       LOG(ERROR) << "Unable to find usable memory address";
       return;
     }
     DataPtr = reinterpret_cast<uint8_t *>(UsableAddress);
-    if (MinPage != 0) {
-      if ((mmap(DataPtr, MinPage * kPageSize, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0)) ==
-          MAP_FAILED) {
-        LOG(ERROR) << "mmap failed";
-        return;
+    if (MinPage) {
+      auto Result [[maybe_unused]] =
+          mmap(DataPtr, MinPage * kPageSize, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+      assert(Result != MAP_FAILED);
+    }
+    Used.insert(std::lower_bound(Used.begin(), Used.end(), UsableAddress),
+                UsableAddress);
+  }
+  ~MemoryInstance() noexcept {
+    if (DataPtr) {
+      std::unique_lock Lock(Mutex);
+      const auto UsableAddress = uintptr_t(DataPtr);
+      const auto UsedIter = std::find(Used.begin(), Used.end(), UsableAddress);
+      assert(UsedIter != Used.end());
+      Used.erase(UsedIter);
+      if (MinPage) {
+        munmap(DataPtr, MinPage * kPageSize);
       }
     }
   }
-  ~MemoryInstance() noexcept { munmap(DataPtr, k8G); }
 
   /// Get page size of memory.data
   uint32_t getDataPageSize() const noexcept { return MinPage; }
@@ -119,19 +163,25 @@ public:
     if (HasMaxPage) {
       MaxPageCaped = std::min(MaxPage, MaxPageCaped);
     }
-    if (Count + MinPage > MaxPageCaped) {
+    if (Count > MaxPageCaped - MinPage) {
       return false;
     }
-    if (MinPage == 0) {
-      if (mmap(DataPtr, Count * kPageSize, PROT_READ | PROT_WRITE,
-               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
+    const uint32_t NewMinPage = MinPage + Count;
+    if (MinPage) {
+      auto Result =
+          mremap(DataPtr, MinPage * kPageSize, NewMinPage * kPageSize, 0);
+      if (Result == MAP_FAILED) {
         return false;
       }
-    } else if (mremap(DataPtr, MinPage * kPageSize,
-                      (MinPage + Count) * kPageSize, 0) == MAP_FAILED) {
-      return false;
+    } else {
+      auto Result =
+          mmap(DataPtr, NewMinPage * kPageSize, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+      if (Result == MAP_FAILED) {
+        return false;
+      }
     }
-    MinPage += Count;
+    MinPage = NewMinPage;
     return true;
   }
 

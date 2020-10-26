@@ -5,21 +5,44 @@
 #include "common/value.h"
 #include "interpreter/interpreter.h"
 
+#include <atomic>
+#include <mutex>
+
 namespace SSVM {
 namespace Interpreter {
 
-Interpreter *Interpreter::This = nullptr;
-std::jmp_buf *Interpreter::TrapJump = nullptr;
+namespace {
+static uint32_t AliveInstanceCount = 0;
+static std::mutex SignalMutex;
+} // namespace
 
-struct Interpreter::SignalEnabler {
-  SignalEnabler() noexcept { Interpreter::signalEnable(); }
-  ~SignalEnabler() noexcept { Interpreter::signalDisable(); }
+thread_local Interpreter *Interpreter::This = nullptr;
+
+struct Interpreter::CompiledContext {
+  CompiledContext(Interpreter *T) noexcept : _(T) { _->enterCompiledContext(); }
+  ~CompiledContext() noexcept { _->leaveCompiledContext(); }
+  Interpreter *_;
 };
 
-struct Interpreter::SignalDisabler {
-  SignalDisabler() noexcept { Interpreter::signalDisable(); }
-  ~SignalDisabler() noexcept { Interpreter::signalEnable(); }
+struct Interpreter::HostContext {
+  HostContext(Interpreter *T) noexcept : _(T) { _->leaveCompiledContext(); }
+  ~HostContext() noexcept { _->enterCompiledContext(); }
+  Interpreter *_;
 };
+
+void Interpreter::InstanceIncrease() {
+  std::unique_lock Lock(SignalMutex);
+  ++AliveInstanceCount;
+}
+void Interpreter::InstanceDecrease() {
+  std::unique_lock Lock(SignalMutex);
+  assert(AliveInstanceCount > 0);
+  --AliveInstanceCount;
+  if (AliveInstanceCount == 0) {
+    std::signal(SIGFPE, SIG_DFL);
+    std::signal(SIGSEGV, SIG_DFL);
+  }
+}
 
 template <typename RetT, typename... ArgsT>
 struct Interpreter::ProxyHelper<Expect<RetT> (Interpreter::*)(
@@ -27,10 +50,10 @@ struct Interpreter::ProxyHelper<Expect<RetT> (Interpreter::*)(
   template <Expect<RetT> (Interpreter::*Func)(Runtime::StoreManager &,
                                               ArgsT...) noexcept>
   static RetT proxy(ArgsT... Args) noexcept {
-    Interpreter::SignalDisabler Disabler;
-    if (auto Res = (This->*Func)(*This->CurrentStore, Args...);
-        unlikely(!Res)) {
-      siglongjmp(*TrapJump, uint8_t(Res.error()));
+    auto *_ = This;
+    HostContext Host(_);
+    if (auto Res = (_->*Func)(*_->CurrentStore, Args...); unlikely(!Res)) {
+      siglongjmp(*_->TrapJump, uint8_t(Res.error()));
     } else if constexpr (!std::is_void_v<RetT>) {
       return *Res;
     }
@@ -76,8 +99,16 @@ AST::Module::IntrinsicsTable intrinsics = {
 #pragma clang diagnostic pop
 #endif
 
+/// SIGBUS, SIGFPE, SIGILL, and SIGSEGV will send to the same thread that
+/// generated it.
+
 void Interpreter::signalHandler(int Signal, siginfo_t *Siginfo,
                                 void *) noexcept {
+  if (This == nullptr) {
+    return;
+  }
+  auto *_ = This;
+  HostContext Host(_);
   int Status;
   switch (Signal) {
   case SIGSEGV:
@@ -90,20 +121,23 @@ void Interpreter::signalHandler(int Signal, siginfo_t *Siginfo,
   default:
     __builtin_unreachable();
   }
-  siglongjmp(*This->TrapJump, Status);
+  siglongjmp(*_->TrapJump, Status);
 }
 
-void Interpreter::signalEnable() noexcept {
+void Interpreter::enterCompiledContext() noexcept {
+  assert(This == nullptr);
+  This = this;
   struct sigaction Action {};
   Action.sa_sigaction = &signalHandler;
-  Action.sa_flags = SA_SIGINFO;
+  Action.sa_flags = SA_SIGINFO | SA_NODEFER;
+  sigemptyset(&Action.sa_mask);
   sigaction(SIGFPE, &Action, nullptr);
   sigaction(SIGSEGV, &Action, nullptr);
 }
 
-void Interpreter::signalDisable() noexcept {
-  std::signal(SIGFPE, SIG_DFL);
-  std::signal(SIGSEGV, SIG_DFL);
+void Interpreter::leaveCompiledContext() noexcept {
+  assert(This != nullptr);
+  This = nullptr;
 }
 
 Expect<void> Interpreter::trap(Runtime::StoreManager &StoreMgr,
@@ -1114,9 +1148,10 @@ Interpreter::enterFunction(Runtime::StoreManager &StoreMgr,
 
     const int Status = sigsetjmp(*TrapJump, true);
     if (Status == 0) {
-      SignalEnabler Enabler;
+      CompiledContext Compiled(this);
       Wrapper(&ExecutionContext, CompiledFunc.get(), Args.data(), Rets.data());
     }
+    assert(This == nullptr);
 
     TrapJump = std::move(OldTrapJump);
 
