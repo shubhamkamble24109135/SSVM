@@ -329,7 +329,7 @@ static llvm::Type *toLLVMType(llvm::LLVMContext &LLContext,
   case ValType::ExternRef:
     return llvm::Type::getInt64Ty(LLContext);
   case ValType::V128:
-    return llvm::VectorType::get(llvm::Type::getInt128Ty(LLContext), 1, false);
+    return llvm::VectorType::get(llvm::Type::getInt64Ty(LLContext), 2, false);
   case ValType::F32:
     return llvm::Type::getFloatTy(LLContext);
   case ValType::F64:
@@ -392,7 +392,7 @@ static llvm::Constant *toLLVMConstantZero(llvm::LLVMContext &LLContext,
     return llvm::ConstantInt::get(llvm::Type::getInt64Ty(LLContext), 0);
   case ValType::V128:
     return llvm::ConstantAggregateZero::get(
-        llvm::VectorType::get(llvm::Type::getIntNTy(LLContext, 128), 1, false));
+        llvm::VectorType::get(llvm::Type::getInt64Ty(LLContext), 2, false));
   case ValType::F32:
     return llvm::ConstantFP::get(llvm::Type::getFloatTy(LLContext), 0.0f);
   case ValType::F64:
@@ -1645,8 +1645,8 @@ public:
   Expect<void> compile(const AST::SIMDMemoryInstruction &Instr) {
     switch (Instr.getOpCode()) {
     case OpCode::V128__load:
-      return compileLoadOp(Instr.getMemoryOffset(), Instr.getMemoryAlign(),
-                           Context.Int128x1Ty);
+      return compileVectorLoadOp(Instr.getMemoryOffset(),
+                                 Instr.getMemoryAlign(), Context.Int128x1Ty);
     case OpCode::I16x8__load8x8_s:
       return compileVectorLoadOp(
           Instr.getMemoryOffset(), Instr.getMemoryAlign(),
@@ -1699,7 +1699,7 @@ public:
                                  Context.Int128Ty, false);
     case OpCode::V128__store:
       return compileStoreOp(Instr.getMemoryOffset(), Instr.getMemoryAlign(),
-                            Context.Int128x1Ty);
+                            Context.Int128x1Ty, false, true);
     default:
       __builtin_unreachable();
     }
@@ -1711,7 +1711,7 @@ public:
     uint64_t High = uint64_t(Value >> 64);
     auto *Vector = llvm::ConstantVector::get(
         {Builder.getInt64(Lower), Builder.getInt64(High)});
-    stackPush(Builder.CreateBitCast(Vector, Context.Int128x1Ty));
+    stackPush(Builder.CreateBitCast(Vector, Context.Int64x2Ty));
     return {};
   }
   Expect<void> compile(const AST::SIMDShuffleInstruction &Instr) {
@@ -1725,7 +1725,7 @@ public:
         Mask[I] = static_cast<uint8_t>(V3 >> (I * 8));
       }
       stackPush(Builder.CreateBitCast(Builder.CreateShuffleVector(V1, V2, Mask),
-                                      Context.Int128x1Ty));
+                                      Context.Int64x2Ty));
       return {};
     }
     default:
@@ -1789,7 +1789,7 @@ public:
         stackPush(Builder.CreateBitCast(
             Builder.CreateIntrinsic(llvm::Intrinsic::x86_ssse3_pshuf_b_128, {},
                                     {Vector, NewIndex}),
-            Context.Int128x1Ty));
+            Context.Int64x2Ty));
         return {};
       }
 #endif
@@ -1799,7 +1799,7 @@ public:
         stackPush(Builder.CreateBitCast(
             Builder.CreateIntrinsic(llvm::Intrinsic::aarch64_neon_tbl1, {},
                                     {Vector, Index}),
-            Context.Int128x1Ty));
+            Context.Int64x2Ty));
         return {};
       }
 #endif
@@ -1821,7 +1821,7 @@ public:
         Ret = Builder.CreateInsertElement(Ret, Value, I);
       }
       Ret = Builder.CreateSelect(IsOver, Zero, Ret);
-      stackPush(Builder.CreateBitCast(Ret, Context.Int128x1Ty));
+      stackPush(Builder.CreateBitCast(Ret, Context.Int64x2Ty));
       return {};
     }
     case OpCode::I8x16__splat:
@@ -2166,7 +2166,7 @@ public:
       auto *R = Builder.CreateShuffleVector(
           M, Undef, std::array<ShuffleElement, 4>{1, 3, 5, 7});
       auto *V = Builder.CreateAdd(L, R);
-      stackPush(Builder.CreateBitCast(V, Context.Int128x1Ty));
+      stackPush(Builder.CreateBitCast(V, Context.Int64x2Ty));
       return {};
     }
 
@@ -2575,13 +2575,21 @@ private:
     return {};
   }
   Expect<void> compileVectorLoadOp(unsigned Offset, unsigned Alignment,
+                                   llvm::Type *LoadTy) {
+    if (auto Ret = compileLoadOp(Offset, Alignment, LoadTy); !Ret) {
+      return Unexpect(Ret);
+    }
+    Stack.back() = Builder.CreateBitCast(Stack.back(), Context.Int64x2Ty);
+    return {};
+  }
+  Expect<void> compileVectorLoadOp(unsigned Offset, unsigned Alignment,
                                    llvm::Type *LoadTy, llvm::Type *ExtendTy,
                                    bool Signed) {
     if (auto Ret = compileLoadOp(Offset, Alignment, LoadTy, ExtendTy, Signed);
         !Ret) {
       return Unexpect(Ret);
     }
-    Stack.back() = Builder.CreateBitCast(Stack.back(), Context.Int128x1Ty);
+    Stack.back() = Builder.CreateBitCast(Stack.back(), Context.Int64x2Ty);
     return {};
   }
   Expect<void> compileSplatLoadOp(unsigned Offset, unsigned Alignment,
@@ -2593,7 +2601,8 @@ private:
     return compileSplatOp(VectorTy);
   }
   Expect<void> compileStoreOp(unsigned Offset, unsigned Alignment,
-                              llvm::Type *LoadTy, bool Trunc = false) {
+                              llvm::Type *LoadTy, bool Trunc = false,
+                              bool BitCast = false) {
     if constexpr (kForceUnalignment) {
       Alignment = 0;
     }
@@ -2605,6 +2614,9 @@ private:
 
     if (Trunc) {
       V = Builder.CreateTrunc(V, LoadTy);
+    }
+    if (BitCast) {
+      V = Builder.CreateBitCast(V, LoadTy);
     }
     auto *VPtr =
         Builder.CreateInBoundsGEP(Context.getMemory(Builder, ExecCtx), {Off});
@@ -2622,7 +2634,7 @@ private:
     auto *Vector = Builder.CreateInsertElement(Undef, Value, kZero);
     Vector = Builder.CreateShuffleVector(Vector, Undef, Zeros);
 
-    Stack.back() = Builder.CreateBitCast(Vector, Context.Int128x1Ty);
+    Stack.back() = Builder.CreateBitCast(Vector, Context.Int64x2Ty);
     return {};
   }
   Expect<void> compileExtractLaneOp(llvm::VectorType *VectorTy,
@@ -2650,7 +2662,7 @@ private:
     Stack.back() = Builder.CreateBitCast(
         Builder.CreateInsertElement(Builder.CreateBitCast(Vector, VectorTy),
                                     Value, Index),
-        Context.Int128x1Ty);
+        Context.Int64x2Ty);
     return {};
   }
   Expect<void> compileVectorCompareOp(llvm::VectorType *VectorTy,
@@ -2661,7 +2673,7 @@ private:
         Builder.CreateICmp(Predicate, Builder.CreateBitCast(LHS, VectorTy),
                            Builder.CreateBitCast(RHS, VectorTy)),
         VectorTy);
-    stackPush(Builder.CreateBitCast(Result, Context.Int128x1Ty));
+    stackPush(Builder.CreateBitCast(Result, Context.Int64x2Ty));
     return {};
   }
   Expect<void> compileVectorCompareOp(llvm::VectorType *VectorTy,
@@ -2673,13 +2685,13 @@ private:
         Builder.CreateFCmp(Predicate, Builder.CreateBitCast(LHS, VectorTy),
                            Builder.CreateBitCast(RHS, VectorTy)),
         ResultTy);
-    stackPush(Builder.CreateBitCast(Result, Context.Int128x1Ty));
+    stackPush(Builder.CreateBitCast(Result, Context.Int64x2Ty));
     return {};
   }
   template <typename Func>
   Expect<void> compileVectorOp(llvm::VectorType *VectorTy, Func &&Op) {
     auto *V = Builder.CreateBitCast(Stack.back(), VectorTy);
-    Stack.back() = Builder.CreateBitCast(Op(V), Context.Int128x1Ty);
+    Stack.back() = Builder.CreateBitCast(Op(V), Context.Int64x2Ty);
     return {};
   }
   Expect<void> compileVectorAbs(llvm::VectorType *VectorTy) {
@@ -2731,7 +2743,7 @@ private:
         VectorTy->getElementCount().Min,
         Builder.CreateZExtOrTrunc(N, VectorTy->getElementType()));
     auto *LHS = Builder.CreateBitCast(stackPop(), VectorTy);
-    stackPush(Builder.CreateBitCast(Op(LHS, RHS), Context.Int128x1Ty));
+    stackPush(Builder.CreateBitCast(Op(LHS, RHS), Context.Int64x2Ty));
     return {};
   }
   Expect<void> compileVectorShl(llvm::VectorType *VectorTy) {
@@ -2753,7 +2765,7 @@ private:
   Expect<void> compileVectorVectorOp(llvm::VectorType *VectorTy, Func &&Op) {
     auto *RHS = Builder.CreateBitCast(stackPop(), VectorTy);
     auto *LHS = Builder.CreateBitCast(stackPop(), VectorTy);
-    stackPush(Builder.CreateBitCast(Op(LHS, RHS), Context.Int128x1Ty));
+    stackPush(Builder.CreateBitCast(Op(LHS, RHS), Context.Int64x2Ty));
     return {};
   }
   Expect<void> compileVectorVectorAdd(llvm::VectorType *VectorTy) {
@@ -2853,7 +2865,7 @@ private:
     std::vector<ShuffleElement> Mask(Count * 2);
     std::iota(Mask.begin(), Mask.end(), 0);
     stackPush(Builder.CreateBitCast(Builder.CreateShuffleVector(F1, F2, Mask),
-                                    Context.Int128x1Ty));
+                                    Context.Int64x2Ty));
     return {};
   }
   Expect<void> compileVectorWiden(llvm::VectorType *FromTy, bool Signed,
@@ -2869,7 +2881,7 @@ private:
       F = Builder.CreateZExt(F, ExtTy);
     }
     F = Builder.CreateShuffleVector(F, llvm::UndefValue::get(ExtTy), Mask);
-    Stack.back() = Builder.CreateBitCast(F, Context.Int128x1Ty);
+    Stack.back() = Builder.CreateBitCast(F, Context.Int64x2Ty);
     return {};
   }
   Expect<void> compileVectorFAbs(llvm::VectorType *VectorTy) {
@@ -2956,8 +2968,8 @@ private:
       auto *OLT = Builder.CreateFCmpOLT(LHS, RHS);
       auto *OGT = Builder.CreateFCmpOGT(LHS, RHS);
       llvm::Value *Ret = Builder.CreateBitCast(
-          Builder.CreateOr(Builder.CreateBitCast(LHS, Context.Int128x1Ty),
-                           Builder.CreateBitCast(RHS, Context.Int128x1Ty)),
+          Builder.CreateOr(Builder.CreateBitCast(LHS, Context.Int64x2Ty),
+                           Builder.CreateBitCast(RHS, Context.Int64x2Ty)),
           LHS->getType());
       Ret = Builder.CreateSelect(OGT, RHS, Ret);
       Ret = Builder.CreateSelect(OLT, LHS, Ret);
@@ -2973,8 +2985,8 @@ private:
       auto *OLT = Builder.CreateFCmpOLT(LHS, RHS);
       auto *OGT = Builder.CreateFCmpOGT(LHS, RHS);
       llvm::Value *Ret = Builder.CreateBitCast(
-          Builder.CreateAnd(Builder.CreateBitCast(LHS, Context.Int128x1Ty),
-                            Builder.CreateBitCast(RHS, Context.Int128x1Ty)),
+          Builder.CreateAnd(Builder.CreateBitCast(LHS, Context.Int64x2Ty),
+                            Builder.CreateBitCast(RHS, Context.Int64x2Ty)),
           LHS->getType());
       Ret = Builder.CreateSelect(OLT, RHS, Ret);
       Ret = Builder.CreateSelect(OGT, LHS, Ret);
@@ -3063,7 +3075,7 @@ private:
     auto *C = Builder.CreateBitCast(stackPop(), VectorTy);
     auto *B = Builder.CreateBitCast(stackPop(), VectorTy);
     auto *A = Builder.CreateBitCast(stackPop(), VectorTy);
-    stackPush(Builder.CreateBitCast(Op(A, B, C), Context.Int128x1Ty));
+    stackPush(Builder.CreateBitCast(Op(A, B, C), Context.Int64x2Ty));
     return {};
   }
   Expect<void> compileVectorVectorVectorQFMA(llvm::VectorType *VectorTy) {
